@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="description" content="YOLO26 Native End-to-End推論を搭載したスマートフォン対応ミリタリー・スポッターHUDカメラWebアプリ">
+  <title>TACTICAL SPOTTER HUD // YOLO26</title>
+  
+  <!-- ONNX Runtime Web CDN (WebGPU & WASM 両対応最新版) -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.all.min.js"></script>
+
+  <style>
+    :root {
+      --primary-color: #00FF66;
+      --primary-dim: rgba(0, 255, 102, 0.25);
+      --primary-glow: rgba(0, 255, 102, 0.6);
+      --bg-dark: #050a06;
+      --danger-color: #ff3344;
+      --font-hud: "Share Tech Mono", "Courier New", Consolas, monospace;
+    }
+
+    [data-theme="amber"] {
+      --primary-color: #FFB000;
+      --primary-dim: rgba(255, 176, 0, 0.25);
+      --primary-glow: rgba(255, 176, 0, 0.6);
+      --bg-dark: #0a0805;
+      --danger-color: #ff3344;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      height: 100dvh;
+      overflow: hidden;
+      background-color: var(--bg-dark);
+      font-family: var(--font-hud);
+      color: var(--primary-color);
+      position: relative;
+    }
+
+    /* ビデオ要素（推論入力用。非表示） */
+    #webcam {
+      display: none;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    /* メイン描画キャンバス（全画面） */
+    #hudCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      height: 100dvh;
+      object-fit: cover;
+      display: block;
+      z-index: 1;
+    }
+
+    /* HUD CRTスキャンライン & 暗視ビネットオーバーレイ */
+    .crt-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 2;
+      background: radial-gradient(circle at center, transparent 60%, rgba(0, 10, 2, 0.75) 100%),
+                  linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%);
+      background-size: 100% 100%, 100% 4px;
+      mix-blend-mode: overlay;
+    }
+
+    /* UI コントロール & 上部・下部インジケータ */
+    .hud-ui-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 3;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: env(safe-area-inset-top, 12px) env(safe-area-inset-right, 12px) env(safe-area-inset-bottom, 12px) env(safe-area-inset-left, 12px);
+    }
+
+    /* ヘッダーエリア */
+    .hud-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      text-shadow: 0 0 6px var(--primary-glow);
+      font-size: 11px;
+      line-height: 1.4;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+
+    .hud-tag {
+      border: 1px solid var(--primary-color);
+      padding: 2px 6px;
+      background: rgba(0, 20, 5, 0.4);
+      display: inline-block;
+      margin-bottom: 4px;
+    }
+
+    /* コンパス（上部中央） */
+    .compass-container {
+      position: absolute;
+      top: env(safe-area-inset-top, 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 220px;
+      height: 32px;
+      overflow: hidden;
+      border-bottom: 1px solid var(--primary-color);
+      background: linear-gradient(180deg, rgba(0,255,102,0.05), transparent);
+      text-align: center;
+    }
+
+    .compass-tape {
+      display: flex;
+      justify-content: center;
+      align-items: flex-end;
+      height: 100%;
+      font-size: 10px;
+      transition: transform 0.1s linear;
+      position: relative;
+    }
+
+    .compass-marker {
+      position: absolute;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 0;
+      height: 0;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-bottom: 6px solid var(--primary-color);
+    }
+
+    /* フッターエリア */
+    .hud-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      text-shadow: 0 0 6px var(--primary-glow);
+      font-size: 11px;
+      letter-spacing: 1px;
+    }
+
+    .hud-controls {
+      pointer-events: auto;
+      display: flex;
+      gap: 8px;
+    }
+
+    .hud-btn {
+      background: rgba(0, 20, 5, 0.6);
+      border: 1px solid var(--primary-color);
+      color: var(--primary-color);
+      padding: 6px 12px;
+      font-family: inherit;
+      font-size: 11px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      text-transform: uppercase;
+      box-shadow: 0 0 4px var(--primary-dim);
+      transition: all 0.2s;
+    }
+
+    .hud-btn:active {
+      background: var(--primary-color);
+      color: #000;
+      box-shadow: 0 0 10px var(--primary-color);
+    }
+
+    /* 起動前・エラー時モーダル */
+    .modal-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 10;
+      background: rgba(4, 10, 6, 0.92);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 24px;
+      text-align: center;
+      pointer-events: auto;
+    }
+
+    .modal-box {
+      max-width: 440px;
+      border: 1px solid var(--primary-color);
+      padding: 24px;
+      background: rgba(0, 20, 8, 0.85);
+      box-shadow: 0 0 20px var(--primary-dim);
+    }
+
+    .modal-title {
+      font-size: 18px;
+      margin-bottom: 12px;
+      letter-spacing: 2px;
+      text-shadow: 0 0 8px var(--primary-glow);
+    }
+
+    .modal-desc {
+      font-size: 12px;
+      line-height: 1.6;
+      margin-bottom: 20px;
+      color: rgba(255, 255, 255, 0.85);
+    }
+
+    .start-btn {
+      background: var(--primary-color);
+      color: #000;
+      font-weight: bold;
+      border: none;
+      padding: 12px 28px;
+      font-family: inherit;
+      font-size: 14px;
+      letter-spacing: 2px;
+      cursor: pointer;
+      text-transform: uppercase;
+      box-shadow: 0 0 15px var(--primary-glow);
+      transition: transform 0.1s, box-shadow 0.2s;
+    }
+
+    .start-btn:active {
+      transform: scale(0.96);
+    }
+
+    .status-log {
+      font-size: 10px;
+      margin-top: 14px;
+      color: var(--primary-color);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* レンジバー（右端） */
+    .range-bar {
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      height: 220px;
+      width: 16px;
+      border-right: 1px solid var(--primary-color);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: flex-end;
+      font-size: 9px;
+      padding-right: 4px;
+    }
+
+    .range-tick {
+      width: 6px;
+      height: 1px;
+      background: var(--primary-color);
+    }
+
+    .range-tick.major {
+      width: 12px;
+    }
+  </style>
+</head>
+<body data-theme="green">
+  <!-- カメラ映像（オフスクリーン入力） -->
+  <video id="webcam" playsinline autoplay muted></video>
+
+  <!-- 全画面描画キャンバス (カメラ映像 + ミリタリーHUD) -->
+  <canvas id="hudCanvas"></canvas>
+
+  <!-- CRTスキャンライン & ナイトビジョンビネット効果 -->
+  <div class="crt-overlay"></div>
+
+  <!-- UI & インジケータレイヤー -->
+  <div class="hud-ui-layer">
+    <!-- ヘッダー情報 -->
+    <header class="hud-header">
+      <div class="header-left">
+        <div class="hud-tag">SYS // SPOTTER-HUD 26</div><br>
+        <div>OPTICS: <span id="opticsStatus" style="color:var(--primary-color)">STANDBY</span></div>
+        <div>ENGINE: <span id="engineProvider">DETECTING...</span></div>
+        <div>INFER: <span id="inferenceTime">-- ms</span> (<span id="fpsCounter">-- FPS</span>)</div>
+      </div>
+
+      <!-- 中央上部コンパス -->
+      <div class="compass-container">
+        <div class="compass-marker"></div>
+        <div class="compass-tape" id="compassTape">
+          <span>NW ··· 330 ··· 345 ··· <b>N</b> ··· 015 ··· 030 ··· NE</span>
+        </div>
+      </div>
+
+      <div class="header-right" style="text-align: right;">
+        <div class="hud-tag" id="threatLevel">TARGET: PERSON</div><br>
+        <div id="windInfo">WIND: 2.1 m/s 045° &gt;</div>
+        <div>GRID: <span id="gridCoords">34U FD 8921</span></div>
+        <div>PWR: <span id="battLevel">98% [NOMINAL]</span></div>
+      </div>
+    </header>
+
+    <!-- 右側レンジ目盛りスケール -->
+    <div class="range-bar">
+      <span>100</span><div class="range-tick major"></div>
+      <div class="range-tick"></div>
+      <span>75</span><div class="range-tick major"></div>
+      <div class="range-tick"></div>
+      <span>50</span><div class="range-tick major"></div>
+      <div class="range-tick"></div>
+      <span>25</span><div class="range-tick major"></div>
+      <div class="range-tick"></div>
+      <span>0m</span><div class="range-tick major"></div>
+    </div>
+
+    <!-- フッター情報 & 操作ボタン -->
+    <footer class="hud-footer">
+      <div class="footer-left">
+        <div>MODE: RECON / TARGET TRACK</div>
+        <div>LOCK-ON CRITERIA: CONF &gt;= 0.35</div>
+        <div id="targetSummary">TARGETS: 0 IN SECTOR</div>
+      </div>
+
+      <div class="hud-controls">
+        <button id="toggleThemeBtn" class="hud-btn" title="Toggle NVG Green / Amber Thermal">COLOR: NVG</button>
+        <button id="toggleCameraBtn" class="hud-btn" title="Switch Camera">CAM SW</button>
+        <button id="selectModelBtn" class="hud-btn" title="Load custom ONNX">CUSTOM .ONNX</button>
+        <input type="file" id="modelFileInput" accept=".onnx" style="display: none;">
+      </div>
+    </footer>
+  </div>
+
+  <!-- 開始・権限要求モーダル -->
+  <div id="startModal" class="modal-overlay">
+    <div class="modal-box">
+      <h1 class="modal-title">TACTICAL SPOTTER HUD</h1>
+      <p class="modal-desc">
+        YOLO26 Native End-to-End推論エンジン搭載。<br>
+        WebGPU高精度ハードウェア加速により、リアルタイム測距（Range）、ミル角（Elevation MIL）、および弾道観測HUDを展開します。
+      </p>
+      <button id="startSystemBtn" class="start-btn">ENGAGE OPTICS</button>
+      <div id="modalStatusLog" class="status-log">SYSTEM READY. CLICK TO ENGAGE.</div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
