@@ -37,6 +37,7 @@ def export_yolo26():
     exported_path = model.export(
         format="onnx",
         imgsz=640,
+        nms=True,
         dynamic=False,
         simplify=True,
         opset=17
