@@ -34,8 +34,29 @@ const COCO_CLASSES = [
 const OPTICS_MODES = [
   { id: 'nvg', label: 'OPTICS: NVG' },
   { id: 'amber', label: 'OPTICS: AMBER' },
-  { id: 'flir', label: 'OPTICS: FLIR (B&W)' },
-  { id: 'thermal', label: 'OPTICS: THERMAL' }
+  { id: 'flir', label: 'OPTICS: FLIR (B&W)' }
+];
+
+// ターゲット追尾モード定義 (パターンC: PERSON / VEHICLE / ALL)
+const TARGET_MODES = [
+  {
+    id: 'PERSON',
+    label: 'TGT: PERSON',
+    headerTag: 'TARGET: PERSON',
+    classIds: [0] // person
+  },
+  {
+    id: 'VEHICLE',
+    label: 'TGT: VEHICLE',
+    headerTag: 'TARGET: VEHICLE',
+    classIds: [1, 2, 3, 5, 7] // bicycle, car, motorcycle, bus, truck
+  },
+  {
+    id: 'ALL',
+    label: 'TGT: ALL HOSTILE',
+    headerTag: 'TARGET: ALL HOSTILE',
+    classIds: null // 全物体
+  }
 ];
 
 // ==========================================
@@ -49,6 +70,7 @@ const state = {
   isRunning: false,
   isProcessing: false,
   themeIndex: 0, // OPTICS_MODES[0] -> 'nvg'
+  targetModeIndex: 0, // TARGET_MODES[0] -> 'PERSON'
   focalLength: 0,
   scaleInfo: { scale: 1, offsetX: 0, offsetY: 0, renderWidth: 0, renderHeight: 0 },
   fps: 0,
@@ -79,8 +101,10 @@ const engineProviderEl = document.getElementById('engineProvider');
 const inferenceTimeEl = document.getElementById('inferenceTime');
 const fpsCounterEl = document.getElementById('fpsCounter');
 const windInfoEl = document.getElementById('windInfo');
+const threatLevelEl = document.getElementById('threatLevel');
 const targetSummaryEl = document.getElementById('targetSummary');
 const compassTapeEl = document.getElementById('compassTape');
+const toggleTargetBtn = document.getElementById('toggleTargetBtn');
 const toggleThemeBtn = document.getElementById('toggleThemeBtn');
 const toggleCameraBtn = document.getElementById('toggleCameraBtn');
 const selectModelBtn = document.getElementById('selectModelBtn');
@@ -96,6 +120,7 @@ const preprocessCtx = preprocessCanvas.getContext('2d', { willReadFrequently: tr
 // イベントリスナー初期化
 // ==========================================
 startSystemBtn.addEventListener('click', initSystem);
+toggleTargetBtn.addEventListener('click', toggleTargetMode);
 toggleThemeBtn.addEventListener('click', toggleTheme);
 toggleCameraBtn.addEventListener('click', switchCamera);
 selectModelBtn.addEventListener('click', () => modelFileInput.click());
@@ -355,6 +380,14 @@ async function runInference() {
   return parseYOLO26EndToEndOutput(outputTensor);
 }
 
+// クラス別想定サイズ (ピンホール測距用)
+function getTargetRealHeight(classId) {
+  if (classId === 0) return 1.7; // 人間 (1.7m)
+  if ([2, 5, 7].includes(classId)) return 1.5; // 乗用車・バス・トラック等の車高目安 (1.5m)
+  if ([1, 3].includes(classId)) return 1.1; // 自転車・バイク (1.1m)
+  return 0.8; // その他 (0.8m)
+}
+
 /**
  * YOLO26 Native End-to-End (NMS-free) 出力デコーダー
  * 出力形状仕様: [1, 300, 6] または [batch, num_detections, 6]
@@ -366,6 +399,7 @@ function parseYOLO26EndToEndOutput(tensor) {
   const data = tensor.data;
   const dims = tensor.dims;
   const detections = [];
+  const currentTargetMode = TARGET_MODES[state.targetModeIndex];
 
   // 形状の解析: 通常 dims = [1, 300, 6] または [300, 6]
   let numBoxes = 300;
@@ -386,7 +420,8 @@ function parseYOLO26EndToEndOutput(tensor) {
         const score = data[4 * numBoxes + i];
         const classId = Math.round(data[5 * numBoxes + i]);
 
-        if (score >= CONFIDENCE_THRESHOLD) {
+        const isMatch = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(classId));
+        if (score >= CONFIDENCE_THRESHOLD && isMatch) {
           detections.push(scaleBoundingBox(x1, y1, x2, y2, score, classId));
         }
       }
@@ -407,7 +442,8 @@ function parseYOLO26EndToEndOutput(tensor) {
     const score = data[offset + 4];
     const classId = Math.round(data[offset + 5]);
 
-    if (score >= CONFIDENCE_THRESHOLD) {
+    const isMatch = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(classId));
+    if (score >= CONFIDENCE_THRESHOLD && isMatch) {
       detections.push(scaleBoundingBox(x1, y1, x2, y2, score, classId));
     }
   }
@@ -452,12 +488,11 @@ function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
 function calculateBallisticParams(target) {
   const centerY = canvas.height / 2;
 
-  // 1. 距離算出（ピンホール近似）
-  // realHeight = 1.7 (m), focalLength = canvas.height * 1.2, bboxHeight = box.height
-  const distance = (REAL_HUMAN_HEIGHT * state.focalLength) / Math.max(1, target.height);
+  // 1. ターゲット種別ごとの実サイズを用いた距離算出（ピンホール近似）
+  const realHeight = getTargetRealHeight(target.classId);
+  const distance = (realHeight * state.focalLength) / Math.max(1, target.height);
 
   // 2. 仰角オフセット (Elevation / MIL)
-  // elevationMil = (((box.y + box.height / 2) - centerY) / focalLength * 1000).toFixed(1)
   const targetCenterY = target.y + target.height / 2;
   const elevationMil = (((targetCenterY - centerY) / state.focalLength) * 1000).toFixed(1);
 
@@ -657,18 +692,19 @@ function drawTargets(detections) {
   const primaryColor = getComputedStyle(document.body).getPropertyValue('--primary-color').trim() || '#00FF66';
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
+  const currentTargetMode = TARGET_MODES[state.targetModeIndex];
 
-  // person を優先主ターゲット、それ以外をセカンダリとする
   detections.forEach((target) => {
-    const isPerson = (target.classId === TARGET_CLASS_ID);
+    // 現在のターゲットモード対象なら主ターゲットとしてロックオン
+    const isPrimaryTarget = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(target.classId));
     const { distance, elevationMil } = calculateBallisticParams(target);
 
     ctx.save();
     ctx.strokeStyle = primaryColor;
     ctx.fillStyle = primaryColor;
-    ctx.lineWidth = isPerson ? 2 : 1;
+    ctx.lineWidth = isPrimaryTarget ? 2 : 1;
     ctx.shadowColor = primaryColor;
-    ctx.shadowBlur = isPerson ? 6 : 2;
+    ctx.shadowBlur = isPrimaryTarget ? 6 : 2;
 
     const x = target.x;
     const y = target.y;
@@ -686,7 +722,7 @@ function drawTargets(detections) {
 
     // 右上 ┐
     ctx.moveTo(x + w - bracketSize, y);
-    ctx.lineTo(x + w, y);
+    ctx.lineTo(x + w);
     ctx.lineTo(x + w, y + bracketSize);
 
     // 左下 └
@@ -700,13 +736,13 @@ function drawTargets(detections) {
     ctx.lineTo(x + w, y + h - bracketSize);
     ctx.stroke();
 
-    // ターゲット中心と画面中心の照準リード線（personのみ薄く結線）
-    if (isPerson) {
+    // ターゲット中心と画面中心の照準リード線（主ターゲットのみ結線）
+    if (isPrimaryTarget) {
       const targetCx = x + w / 2;
       const targetCy = y + h / 2;
       ctx.beginPath();
       ctx.setLineDash([2, 6]);
-      ctx.strokeStyle = 'rgba(0, 255, 102, 0.4)';
+      ctx.strokeStyle = primaryColor;
       ctx.moveTo(cx, cy);
       ctx.lineTo(targetCx, targetCy);
       ctx.stroke();
@@ -715,10 +751,9 @@ function drawTargets(detections) {
 
     // --- 情報テキストの描画 (直上 / 直下) ---
     ctx.font = 'bold 11px "Share Tech Mono", "Courier New", monospace';
-    const tagPadding = 4;
 
-    // 上部ヘッダータグ: [LOCKED] HOSTILE (PERSON)
-    const statusText = isPerson 
+    // 上部ヘッダータグ: [LOCKED] HOSTILE (NAME)
+    const statusText = isPrimaryTarget 
       ? `[LOCKED] HOSTILE (${target.className.toUpperCase()})` 
       : `[TRACK] ${target.className.toUpperCase()}`;
     
@@ -745,8 +780,7 @@ function drawTargets(detections) {
 // UI & 環境パラメータ更新
 // ==========================================
 function updateHudStats(detections) {
-  const persons = detections.filter(d => d.classId === TARGET_CLASS_ID);
-  targetSummaryEl.textContent = `TARGETS: ${detections.length} (${persons.length} HOSTILE)`;
+  targetSummaryEl.textContent = `TARGETS: ${detections.length} IN SECTOR`;
   inferenceTimeEl.textContent = `${state.inferenceTime} ms`;
 }
 
@@ -778,6 +812,13 @@ function updateCompassDisplay() {
   }
 }
 
+function toggleTargetMode() {
+  state.targetModeIndex = (state.targetModeIndex + 1) % TARGET_MODES.length;
+  const currentMode = TARGET_MODES[state.targetModeIndex];
+  toggleTargetBtn.textContent = currentMode.label;
+  threatLevelEl.textContent = currentMode.headerTag;
+}
+
 function toggleTheme() {
   state.themeIndex = (state.themeIndex + 1) % OPTICS_MODES.length;
   const currentMode = OPTICS_MODES[state.themeIndex];
@@ -794,7 +835,24 @@ function generateSimulatedTargets() {
   const cx = canvas.width / 2;
   const cy = canvas.height / 2;
 
-  // 画面内をゆっくり周回する擬似ターゲット
+  const currentMode = TARGET_MODES[state.targetModeIndex];
+
+  if (currentMode.id === 'VEHICLE') {
+    // 車両のシミュレーションターゲット (車高1.5m目安)
+    const mockX = cx + Math.sin(mockAngle) * (canvas.width * 0.2) - 90;
+    const mockY = cy + Math.cos(mockAngle * 0.6) * (canvas.height * 0.15) - 50;
+    return [{
+      x: mockX,
+      y: mockY,
+      width: 180,
+      height: 110,
+      score: 0.94,
+      classId: 2,
+      className: 'car'
+    }];
+  }
+
+  // デフォルト / PERSONシミュレーションターゲット (身長1.7m目安)
   const mockX = cx + Math.sin(mockAngle) * (canvas.width * 0.22) - 45;
   const mockY = cy + Math.cos(mockAngle * 0.7) * (canvas.height * 0.18) - 90;
 

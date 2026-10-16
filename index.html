@@ -41,16 +41,6 @@
       --cam-filter: grayscale(1) contrast(1.75) brightness(1.1);
     }
 
-    /* 4. THERMAL: 感知サーマル (Rainbow / Ironbow) */
-    [data-theme="thermal"] {
-      --primary-color: #FF2B75;
-      --primary-dim: rgba(255, 43, 117, 0.3);
-      --primary-glow: rgba(255, 43, 117, 0.7);
-      --bg-dark: #08000a;
-      --danger-color: #00ffff;
-      --cam-filter: contrast(2.2) saturate(3.5) hue-rotate(185deg) invert(0.18) brightness(0.95);
-    }
-
     * {
       box-sizing: border-box;
       margin: 0;
@@ -378,7 +368,8 @@
       </div>
 
       <div class="hud-controls">
-        <button id="toggleThemeBtn" class="hud-btn" title="Cycle Optics: NVG / AMBER / FLIR (B&W) / THERMAL">OPTICS: NVG</button>
+        <button id="toggleTargetBtn" class="hud-btn" title="Filter Target: PERSON / VEHICLE / ALL">TGT: PERSON</button>
+        <button id="toggleThemeBtn" class="hud-btn" title="Cycle Optics: NVG / AMBER / FLIR (B&W)">OPTICS: NVG</button>
         <button id="toggleCameraBtn" class="hud-btn" title="Switch Camera">CAM SW</button>
         <button id="selectModelBtn" class="hud-btn" title="Load custom ONNX">CUSTOM .ONNX</button>
         <input type="file" id="modelFileInput" accept=".onnx" style="display: none;">
