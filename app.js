@@ -31,6 +31,13 @@ const COCO_CLASSES = [
   'hair drier', 'toothbrush'
 ];
 
+const OPTICS_MODES = [
+  { id: 'nvg', label: 'OPTICS: NVG' },
+  { id: 'amber', label: 'OPTICS: AMBER' },
+  { id: 'flir', label: 'OPTICS: FLIR (B&W)' },
+  { id: 'thermal', label: 'OPTICS: THERMAL' }
+];
+
 // ==========================================
 // アプリケーション状態管理
 // ==========================================
@@ -41,13 +48,14 @@ const state = {
   facingMode: 'environment', // 背面カメラ
   isRunning: false,
   isProcessing: false,
-  theme: 'green', // 'green' or 'amber'
+  themeIndex: 0, // OPTICS_MODES[0] -> 'nvg'
   focalLength: 0,
   scaleInfo: { scale: 1, offsetX: 0, offsetY: 0, renderWidth: 0, renderHeight: 0 },
   fps: 0,
   inferenceTime: 0,
   lastFrameTimestamp: performance.now(),
   frameCount: 0,
+  renderCount: 0,
   windSpeed: 2.4,
   windAngle: 45,
   compassHeading: 0,
@@ -59,7 +67,8 @@ const state = {
 // ==========================================
 const video = document.getElementById('webcam');
 const canvas = document.getElementById('hudCanvas');
-const ctx = canvas.getContext('2d', { alpha: false });
+// HUDベクター描画専用の透過コンテキスト (alpha: true)
+const ctx = canvas.getContext('2d', { alpha: true });
 
 const startModal = document.getElementById('startModal');
 const startSystemBtn = document.getElementById('startSystemBtn');
@@ -459,27 +468,31 @@ function calculateBallisticParams(target) {
 }
 
 // ==========================================
-// メイン描画・推論ループ
+// メイン描画・推論ループ (2フレームに1回推論 + 毎フレーム補間描画)
 // ==========================================
-let lastDetections = [];
+let rawDetections = [];
+let smoothedTargets = []; // 毎フレームスムーズにLerp補間される描画用ターゲット
 
 async function renderLoop() {
   if (!state.isRunning) return;
 
+  state.renderCount++;
+
   // FPS計測
   calculateFps();
 
-  // 1. カメラ映像をキャンバスに全画面描画（ダークトーン調）
+  // 1. HUDキャンバスのクリア（ビデオは背面のGPU合成CSSフィルターで直接表示）
   drawCameraFeed();
 
-  // 2. 推論実行（非同期処理が重複しないよう制御）
+  // 2. 推論実行：2フレームに1回の間引き実行 (GPU/CPU負荷を半減)
   const isVideoReady = (!state.isSimulatedCamera && video.readyState === 4);
   const canRunInference = (isVideoReady || state.isSimulatedCamera);
+  const shouldInferThisFrame = (state.renderCount % 2 === 0);
 
-  if (!state.isProcessing && canRunInference) {
+  if (shouldInferThisFrame && !state.isProcessing && canRunInference) {
     state.isProcessing = true;
     runInference().then((detections) => {
-      lastDetections = detections;
+      rawDetections = detections;
       state.isProcessing = false;
       updateHudStats(detections);
     }).catch(err => {
@@ -488,39 +501,61 @@ async function renderLoop() {
     });
   }
 
-  // 3. レティクル（中央十字線 & MILドット目盛り）描画
+  // 3. バウンディングボックスの線形補間（Lerp）追従計算 (毎フレーム滑らかに吸い付く)
+  updateSmoothedTargets();
+
+  // 4. レティクル（中央十字線 & MILドット目盛り）描画
   drawReticle();
 
-  // 4. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画
-  drawTargets(lastDetections);
+  // 5. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画 (毎フレーム60fps描画)
+  drawTargets(smoothedTargets);
 
   requestAnimationFrame(renderLoop);
+}
+
+/** ターゲット位置の指数移動平均（Lerp）補間処理 */
+function updateSmoothedTargets() {
+  const lerpFactor = 0.45; // 追従速度 (0.45で素早くかつ滑らかに補間)
+
+  if (rawDetections.length === 0) {
+    smoothedTargets = [];
+    return;
+  }
+
+  // 簡易マッチングまたは直接補間
+  if (smoothedTargets.length !== rawDetections.length) {
+    // ターゲット数に変動があった場合は直近の検出結果で初期化
+    smoothedTargets = rawDetections.map(d => ({ ...d }));
+    return;
+  }
+
+  for (let i = 0; i < rawDetections.length; i++) {
+    const raw = rawDetections[i];
+    const smoothed = smoothedTargets[i];
+
+    smoothed.x += (raw.x - smoothed.x) * lerpFactor;
+    smoothed.y += (raw.y - smoothed.y) * lerpFactor;
+    smoothed.width += (raw.width - smoothed.width) * lerpFactor;
+    smoothed.height += (raw.height - smoothed.height) * lerpFactor;
+    smoothed.score = raw.score;
+    smoothed.classId = raw.classId;
+    smoothed.className = raw.className;
+  }
 }
 
 // ==========================================
 // HUD グラフィック描画ルーチン
 // ==========================================
 
-/** カメラ映像を全画面アスペクト比維持で描画 */
+/** カメラ映像は背面videoがCSS GPUフィルターでゼロ負荷直接描画。Canvasはクリアのみ */
 function drawCameraFeed() {
-  const { renderWidth, renderHeight, offsetX, offsetY } = state.scaleInfo;
-  
-  // 背景クリア
-  ctx.fillStyle = '#050a06';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // 高速全画面クリア (GPUコンポジタにより最速)
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  if (!state.isSimulatedCamera && video.videoWidth && video.videoHeight) {
-    ctx.save();
-    // ミリタリー暗視スコープ調のコントラストと彩度
-    ctx.filter = state.theme === 'green' 
-      ? 'contrast(1.15) brightness(0.9) sepia(0.3) hue-rotate(60deg)' 
-      : 'contrast(1.15) brightness(0.9) sepia(0.6) hue-rotate(5deg)';
-    ctx.drawImage(video, offsetX, offsetY, renderWidth, renderHeight);
-    ctx.restore();
-  } else {
+  if (state.isSimulatedCamera || !video.videoWidth) {
     // カメラ未接続時 (PC等のテスト用暗視スコープ背景)
     ctx.save();
-    const primaryDim = state.theme === 'green' ? 'rgba(0, 255, 102, 0.08)' : 'rgba(255, 176, 0, 0.08)';
+    const primaryDim = getComputedStyle(document.body).getPropertyValue('--primary-dim').trim() || 'rgba(0, 255, 102, 0.15)';
     ctx.strokeStyle = primaryDim;
     ctx.lineWidth = 1;
     const gridSize = 40;
@@ -744,9 +779,10 @@ function updateCompassDisplay() {
 }
 
 function toggleTheme() {
-  state.theme = state.theme === 'green' ? 'amber' : 'green';
-  document.body.setAttribute('data-theme', state.theme);
-  toggleThemeBtn.textContent = state.theme === 'green' ? 'COLOR: NVG' : 'COLOR: AMBER';
+  state.themeIndex = (state.themeIndex + 1) % OPTICS_MODES.length;
+  const currentMode = OPTICS_MODES[state.themeIndex];
+  document.body.setAttribute('data-theme', currentMode.id);
+  toggleThemeBtn.textContent = currentMode.label;
 }
 
 // ==========================================
