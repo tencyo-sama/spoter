@@ -14,7 +14,7 @@
 const MODEL_PATH = './yolo26n.onnx';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
-const CONFIDENCE_THRESHOLD = 0.35;
+const CONFIDENCE_THRESHOLD = 0.28; // 認識感度を0.28に最適化（0.35だとスマホ画角で弾かれやすいため）
 const TARGET_CLASS_ID = 0; // 0: person
 const REAL_HUMAN_HEIGHT = 1.7; // 人間の想定平均身長 (m)
 
@@ -72,7 +72,7 @@ const state = {
   themeIndex: 0, // OPTICS_MODES[0] -> 'nvg'
   targetModeIndex: 0, // TARGET_MODES[0] -> 'PERSON'
   focalLength: 0,
-  scaleInfo: { scale: 1, offsetX: 0, offsetY: 0, renderWidth: 0, renderHeight: 0 },
+  scaleInfo: { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, renderWidth: window.innerWidth || 1080, renderHeight: window.innerHeight || 1920 },
   fps: 0,
   inferenceTime: 0,
   lastFrameTimestamp: performance.now(),
@@ -209,12 +209,26 @@ async function startCamera() {
   state.isSimulatedCamera = false;
 
   return new Promise((resolve) => {
-    video.onloadedmetadata = () => {
+    let resolved = false;
+    const onReady = () => {
+      handleResize();
       video.play().catch(e => console.warn('Video play warning:', e));
-      resolve();
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
     };
+    video.onloadedmetadata = onReady;
+    video.onloadeddata = onReady;
+    video.oncanplay = onReady;
+    // タイムアウトフォールバック
+    setTimeout(onReady, 1000);
   });
 }
+
+video.addEventListener('loadeddata', handleResize);
+video.addEventListener('playing', handleResize);
+video.addEventListener('resize', handleResize);
 
 async function switchCamera() {
   state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
@@ -229,34 +243,35 @@ function handleResize() {
   // カメラ焦点距離ピクセル目安 (canvas.height * 1.2)
   state.focalLength = canvas.height * 1.2;
 
-  // カメラ映像のアスペクト比を保ちつつCanvasにcoverフィットさせるパラメータ計算
-  if (video.videoWidth && video.videoHeight) {
-    const videoAspect = video.videoWidth / video.videoHeight;
-    const canvasAspect = canvas.width / canvas.height;
+  // videoWidth/Height 未準備時でも破綻しないフォールバック
+  const vw = (video && video.videoWidth > 0) ? video.videoWidth : (canvas.width || 1280);
+  const vh = (video && video.videoHeight > 0) ? video.videoHeight : (canvas.height || 720);
 
-    let renderWidth, renderHeight, offsetX, offsetY;
+  const videoAspect = vw / vh;
+  const canvasAspect = canvas.width / canvas.height;
 
-    if (canvasAspect > videoAspect) {
-      renderWidth = canvas.width;
-      renderHeight = canvas.width / videoAspect;
-      offsetX = 0;
-      offsetY = (canvas.height - renderHeight) / 2;
-    } else {
-      renderHeight = canvas.height;
-      renderWidth = canvas.height * videoAspect;
-      offsetX = (canvas.width - renderWidth) / 2;
-      offsetY = 0;
-    }
+  let renderWidth, renderHeight, offsetX, offsetY;
 
-    state.scaleInfo = {
-      scaleX: renderWidth / video.videoWidth,
-      scaleY: renderHeight / video.videoHeight,
-      offsetX,
-      offsetY,
-      renderWidth,
-      renderHeight
-    };
+  if (canvasAspect > videoAspect) {
+    renderWidth = canvas.width;
+    renderHeight = canvas.width / videoAspect;
+    offsetX = 0;
+    offsetY = (canvas.height - renderHeight) / 2;
+  } else {
+    renderHeight = canvas.height;
+    renderWidth = canvas.height * videoAspect;
+    offsetX = (canvas.width - renderWidth) / 2;
+    offsetY = 0;
   }
+
+  state.scaleInfo = {
+    scaleX: renderWidth / vw,
+    scaleY: renderHeight / vh,
+    offsetX,
+    offsetY,
+    renderWidth,
+    renderHeight
+  };
 }
 
 // ==========================================
@@ -331,8 +346,14 @@ async function handleCustomModelUpload(e) {
 // 画像前処理 (640x640 リサイズ & RGB正規化)
 // ==========================================
 function preprocessImage(sourceVideo) {
-  // 640x640 オフスクリーンキャンバスへ描画
-  preprocessCtx.drawImage(sourceVideo, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+  // video準備完了時のみdrawImageを実行 (クラッシュ防止)
+  if (sourceVideo && sourceVideo.videoWidth > 0 && sourceVideo.videoHeight > 0) {
+    preprocessCtx.drawImage(sourceVideo, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+  } else {
+    preprocessCtx.fillStyle = '#000000';
+    preprocessCtx.fillRect(0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+  }
+
   const imgData = preprocessCtx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT);
   const { data } = imgData;
 
@@ -341,13 +362,9 @@ function preprocessImage(sourceVideo) {
 
   // CHW形式 (1, 3, 640, 640) & 0.0〜1.0正規化
   for (let i = 0; i < channelSize; i++) {
-    const r = data[i * 4] / 255.0;
-    const g = data[i * 4 + 1] / 255.0;
-    const b = data[i * 4 + 2] / 255.0;
-
-    float32Data[i] = r;                          // R
-    float32Data[channelSize + i] = g;            // G
-    float32Data[channelSize * 2 + i] = b;        // B
+    float32Data[i] = data[i * 4] / 255.0;                          // R
+    float32Data[channelSize + i] = data[i * 4 + 1] / 255.0;        // G
+    float32Data[channelSize * 2 + i] = data[i * 4 + 2] / 255.0;    // B
   }
 
   return new ort.Tensor('float32', float32Data, [1, 3, INPUT_HEIGHT, INPUT_WIDTH]);
@@ -401,7 +418,6 @@ function parseYOLO26EndToEndOutput(tensor) {
   const detections = [];
   const currentTargetMode = TARGET_MODES[state.targetModeIndex];
 
-  // 形状の解析: 通常 dims = [1, 300, 6] または [300, 6]
   let numBoxes = 300;
   let elementStride = 6;
 
@@ -452,30 +468,39 @@ function parseYOLO26EndToEndOutput(tensor) {
 }
 
 /**
- * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング
+ * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (NaN防止・完全安全版)
  */
 function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
-  // 座標が 0.0〜1.0 に正規化されているか判定
-  const isNormalized = (x1 <= 1.0 && x2 <= 1.0 && y1 <= 1.0 && y2 <= 1.0 && x2 > 0);
-  
+  // 座標が 0.0〜1.0 正規化系か、0〜640ピクセル系かを判定
+  const maxVal = Math.max(Math.abs(x1), Math.abs(x2), Math.abs(y1), Math.abs(y2));
+  const isNormalized = (maxVal <= 1.05 && maxVal > 0);
+
   let normX1 = isNormalized ? x1 : x1 / INPUT_WIDTH;
   let normY1 = isNormalized ? y1 : y1 / INPUT_HEIGHT;
   let normX2 = isNormalized ? x2 : x2 / INPUT_WIDTH;
   let normY2 = isNormalized ? y2 : y2 / INPUT_HEIGHT;
 
-  // カメラ映像から画面へのスケールとオフセットを適用
-  const { scaleX, scaleY, offsetX, offsetY } = state.scaleInfo;
+  // 0.0〜1.0にクランプ
+  normX1 = Math.max(0, Math.min(1, normX1));
+  normY1 = Math.max(0, Math.min(1, normY1));
+  normX2 = Math.max(0, Math.min(1, normX2));
+  normY2 = Math.max(0, Math.min(1, normY2));
 
-  const boxX = normX1 * video.videoWidth * scaleX + offsetX;
-  const boxY = normY1 * video.videoHeight * scaleY + offsetY;
-  const boxW = (normX2 - normX1) * video.videoWidth * scaleX;
-  const boxH = (normY2 - normY1) * video.videoHeight * scaleY;
+  const rW = (state.scaleInfo && state.scaleInfo.renderWidth > 0) ? state.scaleInfo.renderWidth : canvas.width;
+  const rH = (state.scaleInfo && state.scaleInfo.renderHeight > 0) ? state.scaleInfo.renderHeight : canvas.height;
+  const offX = (state.scaleInfo && typeof state.scaleInfo.offsetX === 'number') ? state.scaleInfo.offsetX : 0;
+  const offY = (state.scaleInfo && typeof state.scaleInfo.offsetY === 'number') ? state.scaleInfo.offsetY : 0;
+
+  const boxX = normX1 * rW + offX;
+  const boxY = normY1 * rH + offY;
+  const boxW = Math.max(10, (normX2 - normX1) * rW);
+  const boxH = Math.max(10, (normY2 - normY1) * rH);
 
   return {
     x: boxX,
     y: boxY,
-    width: Math.max(1, boxW),
-    height: Math.max(1, boxH),
+    width: boxW,
+    height: boxH,
     score: score,
     classId: classId,
     className: COCO_CLASSES[classId] || `CLASS_${classId}`
@@ -513,14 +538,19 @@ async function renderLoop() {
 
   state.renderCount++;
 
+  // ビデオ解像度が遅れて確定した場合の自動再計算
+  if (video.videoWidth > 0 && (!state.scaleInfo.renderWidth || state.scaleInfo.renderWidth === canvas.width)) {
+    handleResize();
+  }
+
   // FPS計測
   calculateFps();
 
-  // 1. HUDキャンバスのクリア（ビデオは背面のGPU合成CSSフィルターで直接表示）
+  // 1. HUDキャンバスのクリア
   drawCameraFeed();
 
-  // 2. 推論実行：2フレームに1回の間引き実行 (GPU/CPU負荷を半減)
-  const isVideoReady = (!state.isSimulatedCamera && video.readyState === 4);
+  // 2. 推論実行：スマホカメラ準備判定 (videoWidth > 0 かつ readyState >= 2)
+  const isVideoReady = (!state.isSimulatedCamera && video.videoWidth > 0 && (video.readyState >= 2 || video.currentTime > 0));
   const canRunInference = (isVideoReady || state.isSimulatedCamera);
   const shouldInferThisFrame = (state.renderCount % 2 === 0);
 
@@ -536,13 +566,13 @@ async function renderLoop() {
     });
   }
 
-  // 3. バウンディングボックスの線形補間（Lerp）追従計算 (毎フレーム滑らかに吸い付く)
+  // 3. バウンディングボックスの線形補間（Lerp）追従計算
   updateSmoothedTargets();
 
   // 4. レティクル（中央十字線 & MILドット目盛り）描画
   drawReticle();
 
-  // 5. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画 (毎フレーム60fps描画)
+  // 5. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画 (毎フレーム描画)
   drawTargets(smoothedTargets);
 
   requestAnimationFrame(renderLoop);
@@ -550,31 +580,34 @@ async function renderLoop() {
 
 /** ターゲット位置の指数移動平均（Lerp）補間処理 */
 function updateSmoothedTargets() {
-  const lerpFactor = 0.45; // 追従速度 (0.45で素早くかつ滑らかに補間)
+  const lerpFactor = 0.5;
 
-  if (rawDetections.length === 0) {
+  if (!rawDetections || rawDetections.length === 0) {
     smoothedTargets = [];
     return;
   }
 
-  // 簡易マッチングまたは直接補間
+  // ターゲット数が異なる場合は直接更新
   if (smoothedTargets.length !== rawDetections.length) {
-    // ターゲット数に変動があった場合は直近の検出結果で初期化
     smoothedTargets = rawDetections.map(d => ({ ...d }));
     return;
   }
 
+  // 同一ターゲット数なら滑らかに追尾
   for (let i = 0; i < rawDetections.length; i++) {
     const raw = rawDetections[i];
-    const smoothed = smoothedTargets[i];
+    const cur = smoothedTargets[i];
 
-    smoothed.x += (raw.x - smoothed.x) * lerpFactor;
-    smoothed.y += (raw.y - smoothed.y) * lerpFactor;
-    smoothed.width += (raw.width - smoothed.width) * lerpFactor;
-    smoothed.height += (raw.height - smoothed.height) * lerpFactor;
-    smoothed.score = raw.score;
-    smoothed.classId = raw.classId;
-    smoothed.className = raw.className;
+    if (!cur || cur.classId !== raw.classId) {
+      smoothedTargets[i] = { ...raw };
+      continue;
+    }
+
+    cur.x += (raw.x - cur.x) * lerpFactor;
+    cur.y += (raw.y - cur.y) * lerpFactor;
+    cur.width += (raw.width - cur.width) * lerpFactor;
+    cur.height += (raw.height - cur.height) * lerpFactor;
+    cur.score = raw.score;
   }
 }
 
