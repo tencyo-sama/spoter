@@ -11,10 +11,10 @@
 // ==========================================
 // 定数・設定
 // ==========================================
-const MODEL_PATH = './yolo26n.onnx';
+const MODEL_PATH = './yolo26n.onnx?v=20261019_04';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
-const CONFIDENCE_THRESHOLD = 0.20; // 認識感度を0.20に調整 (室内・スマホ画角でも確実に捉えられる設定)
+const CONFIDENCE_THRESHOLD = 0.15; // 認識感度を0.15に調整 (室内・スマホ画角・遠距離でも確実に捉えられる高感度設定)
 const TARGET_CLASS_ID = 0; // 0: person
 const REAL_HUMAN_HEIGHT = 1.7; // 人間の想定平均身長 (m)
 
@@ -70,7 +70,7 @@ const state = {
   isRunning: false,
   isProcessing: false,
   themeIndex: 0, // OPTICS_MODES[0] -> 'nvg'
-  targetModeIndex: 0, // TARGET_MODES[0] -> 'PERSON'
+  targetModeIndex: 0, // TARGET_MODES[0] -> 'ALL'
   focalLength: 0,
   scaleInfo: { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, renderWidth: window.innerWidth || 1080, renderHeight: window.innerHeight || 1920 },
   fps: 0,
@@ -81,6 +81,9 @@ const state = {
   windSpeed: 2.4,
   windAngle: 45,
   compassHeading: 0,
+  debugMaxScore: 0,
+  topDetection: null,
+  lastError: '',
   useDemoSimulation: false // モデル未配置時のHUD動作確認用シミュレーション
 };
 
@@ -100,8 +103,10 @@ const opticsStatusEl = document.getElementById('opticsStatus');
 const engineProviderEl = document.getElementById('engineProvider');
 const inferenceTimeEl = document.getElementById('inferenceTime');
 const fpsCounterEl = document.getElementById('fpsCounter');
+const peakConfDisplayEl = document.getElementById('peakConfDisplay');
 const windInfoEl = document.getElementById('windInfo');
 const threatLevelEl = document.getElementById('threatLevel');
+const lockCriteriaEl = document.getElementById('lockCriteria');
 const targetSummaryEl = document.getElementById('targetSummary');
 const compassTapeEl = document.getElementById('compassTape');
 const toggleTargetBtn = document.getElementById('toggleTargetBtn');
@@ -483,6 +488,7 @@ function parseYOLO26EndToEndOutput(tensor) {
   }
 
   let maxScore = 0;
+  let topDetection = null;
 
   // 標準形式 [1, num_boxes, 6]
   for (let i = 0; i < numBoxes; i++) {
@@ -494,7 +500,10 @@ function parseYOLO26EndToEndOutput(tensor) {
     const score = data[offset + 4];
     const classId = Math.round(data[offset + 5]);
 
-    if (score > maxScore) maxScore = score;
+    if (score > maxScore) {
+      maxScore = score;
+      topDetection = { classId, score, className: COCO_CLASSES[classId] || `CLASS_${classId}` };
+    }
 
     const isMatch = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(classId));
     if (score >= CONFIDENCE_THRESHOLD && isMatch) {
@@ -503,6 +512,7 @@ function parseYOLO26EndToEndOutput(tensor) {
   }
 
   state.debugMaxScore = maxScore;
+  state.topDetection = topDetection;
   return detections;
 }
 
@@ -856,7 +866,20 @@ function updateHudStats(detections) {
     const maxConf = (typeof state.debugMaxScore === 'number' && state.debugMaxScore > 0)
       ? `${Math.round(state.debugMaxScore * 100)}%`
       : '0%';
-    targetSummaryEl.textContent = `TARGETS: ${detections.length} [MAX: ${maxConf}]`;
+    targetSummaryEl.textContent = `TARGETS: ${detections.length} [PEAK: ${maxConf}]`;
+  }
+  if (peakConfDisplayEl) {
+    if (state.topDetection && state.topDetection.score > 0.05) {
+      const pct = Math.round(state.topDetection.score * 100);
+      peakConfDisplayEl.textContent = `${pct}% (${state.topDetection.className.toUpperCase()})`;
+      peakConfDisplayEl.style.color = pct >= 15 ? 'var(--primary-color)' : '#FFB000';
+    } else {
+      peakConfDisplayEl.textContent = 'NO ECHO';
+      peakConfDisplayEl.style.color = 'rgba(255,255,255,0.4)';
+    }
+  }
+  if (lockCriteriaEl) {
+    lockCriteriaEl.textContent = `LOCK-ON CRITERIA: CONF >= ${Math.round(CONFIDENCE_THRESHOLD * 100)}%`;
   }
   if (inferenceTimeEl) {
     if (state.lastError) {

@@ -328,6 +328,7 @@
         <div>OPTICS: <span id="opticsStatus" style="color:var(--primary-color)">STANDBY</span></div>
         <div>ENGINE: <span id="engineProvider">DETECTING...</span></div>
         <div>INFER: <span id="inferenceTime">-- ms</span> (<span id="fpsCounter">-- FPS</span>)</div>
+        <div>SENSOR PEAK: <span id="peakConfDisplay">SEARCHING...</span></div>
       </div>
 
       <!-- 中央上部コンパス -->
@@ -339,7 +340,7 @@
       </div>
 
       <div class="header-right" style="text-align: right;">
-        <div class="hud-tag" id="threatLevel">TARGET: PERSON</div><br>
+        <div class="hud-tag" id="threatLevel">TARGET: ALL HOSTILE</div><br>
         <div id="windInfo">WIND: 2.1 m/s 045° &gt;</div>
         <div>GRID: <span id="gridCoords">34U FD 8921</span></div>
         <div>PWR: <span id="battLevel">98% [NOMINAL]</span></div>
@@ -363,7 +364,7 @@
     <footer class="hud-footer">
       <div class="footer-left">
         <div>MODE: RECON / TARGET TRACK</div>
-        <div>LOCK-ON CRITERIA: CONF &gt;= 0.28</div>
+        <div id="lockCriteria">LOCK-ON CRITERIA: CONF &gt;= 0.15</div>
         <div id="targetSummary">TARGETS: 0 IN SECTOR</div>
       </div>
 
@@ -390,6 +391,6 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=20261019_04"></script>
 </body>
 </html>
