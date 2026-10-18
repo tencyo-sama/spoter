@@ -11,7 +11,7 @@
 // ==========================================
 // 定数・設定
 // ==========================================
-const MODEL_PATH = './yolo26n.onnx?v=20261019_04';
+const MODEL_PATH = './yolo26n.onnx?v=20261019_05';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
 const CONFIDENCE_THRESHOLD = 0.15; // 認識感度を0.15に調整 (室内・スマホ画角・遠距離でも確実に捉えられる高感度設定)
@@ -111,6 +111,7 @@ const targetSummaryEl = document.getElementById('targetSummary');
 const compassTapeEl = document.getElementById('compassTape');
 const toggleTargetBtn = document.getElementById('toggleTargetBtn');
 const toggleThemeBtn = document.getElementById('toggleThemeBtn');
+const toggleEpBtn = document.getElementById('toggleEpBtn');
 const toggleCameraBtn = document.getElementById('toggleCameraBtn');
 const selectModelBtn = document.getElementById('selectModelBtn');
 const modelFileInput = document.getElementById('modelFileInput');
@@ -127,6 +128,7 @@ const preprocessCtx = preprocessCanvas.getContext('2d', { willReadFrequently: tr
 startSystemBtn.addEventListener('click', initSystem);
 toggleTargetBtn.addEventListener('click', toggleTargetMode);
 toggleThemeBtn.addEventListener('click', toggleTheme);
+if (toggleEpBtn) toggleEpBtn.addEventListener('click', toggleExecutionProvider);
 toggleCameraBtn.addEventListener('click', switchCamera);
 selectModelBtn.addEventListener('click', () => modelFileInput.click());
 modelFileInput.addEventListener('change', handleCustomModelUpload);
@@ -280,9 +282,9 @@ function handleResize() {
 }
 
 // ==========================================
-// ONNX Runtime Web セッション確立 (WebGPU -> WASM)
+// ONNX Runtime Web セッション確立 (WASM高速安定優先 / WebGPU切替対応)
 // ==========================================
-async function initOnnxSession(modelSource) {
+async function initOnnxSession(modelSource, preferredEp = null) {
   if (typeof ort === 'undefined') {
     console.warn('ONNX Runtime Web library (ort) is not loaded or blocked. Falling back to simulation demo.');
     state.useDemoSimulation = true;
@@ -295,9 +297,9 @@ async function initOnnxSession(modelSource) {
   ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
   ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
 
-  // WebGPU の利用可否チェックと優先試行
+  // スマホではWASM (SIMD) が最も落ちず安定して30FPS出るためWASMを優先。手動でWebGPU切替可能。
   let session = null;
-  const tryProviders = ['webgpu', 'wasm'];
+  const tryProviders = preferredEp ? [preferredEp] : ['wasm', 'webgpu'];
 
   for (const ep of tryProviders) {
     try {
@@ -310,7 +312,6 @@ async function initOnnxSession(modelSource) {
       if (typeof modelSource === 'string') {
         session = await ort.InferenceSession.create(modelSource, options);
       } else {
-        // ArrayBuffer (ユーザーアップロード)
         session = await ort.InferenceSession.create(modelSource, options);
       }
 
@@ -319,17 +320,56 @@ async function initOnnxSession(modelSource) {
       break;
     } catch (e) {
       console.warn(`Execution provider [${ep}] failed:`, e);
-      if (ep === 'wasm') {
-        // 全プロバイダで失敗した場合 (モデルファイル未配置など)
-        console.warn('Could not load yolo26n.onnx. Enabling simulation demo mode.');
-        state.useDemoSimulation = true;
+      if (ep === 'webgpu') {
+        // WebGPU失敗時はWASMで再試行
+        try {
+          session = await ort.InferenceSession.create(modelSource, {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all'
+          });
+          state.activeEp = 'WASM';
+          break;
+        } catch (_) {}
       }
     }
   }
 
+  if (!session) {
+    console.warn('Could not load yolo26n.onnx. Enabling simulation demo mode.');
+    state.useDemoSimulation = true;
+  }
+
   state.session = session;
   engineProviderEl.textContent = state.useDemoSimulation ? 'MOCK / SIM' : state.activeEp;
-  engineProviderEl.style.color = state.activeEp === 'WEBGPU' ? 'var(--primary-color)' : '#FFB000';
+  engineProviderEl.style.color = state.activeEp === 'WEBGPU' ? 'var(--primary-color)' : '#00E5FF';
+  if (toggleEpBtn) {
+    toggleEpBtn.textContent = `EP: ${state.activeEp}`;
+  }
+}
+
+async function switchToWasm() {
+  if (state.activeEp === 'WASM') return;
+  state.activeEp = 'WASM';
+  engineProviderEl.textContent = 'WASM (SAFE)';
+  engineProviderEl.style.color = '#00E5FF';
+  if (toggleEpBtn) toggleEpBtn.textContent = 'EP: WASM';
+  try {
+    state.session = await ort.InferenceSession.create(MODEL_PATH, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all'
+    });
+    state.lastError = '';
+    console.log('[✓] Switched session to WASM successfully');
+  } catch (fbErr) {
+    console.error('WASM fallback failed:', fbErr);
+    state.lastError = `WASM Err: ${fbErr.message}`;
+  }
+}
+
+async function toggleExecutionProvider() {
+  const nextEp = state.activeEp === 'WASM' ? 'webgpu' : 'wasm';
+  updateStatusLog(`Switching to ${nextEp.toUpperCase()}...`);
+  await initOnnxSession(MODEL_PATH, nextEp);
 }
 
 async function handleCustomModelUpload(e) {
@@ -376,7 +416,7 @@ function preprocessImage(sourceVideo) {
 }
 
 // ==========================================
-// 推論実行 & End-to-End (NMS-free) 出力パーサー
+// 推論実行 & End-to-End (NMS-free) 出力パーサー (タイムアウト保護・テンソルDispose完備)
 // ==========================================
 async function runInference() {
   if (!state.session) {
@@ -387,53 +427,58 @@ async function runInference() {
   }
 
   const startTime = performance.now();
-  let inputTensor;
+  let inputTensor = null;
+  let results = null;
+
   try {
     inputTensor = preprocessImage(video);
-  } catch (prepErr) {
-    state.lastError = `Preprocess: ${prepErr.message}`;
-    return [];
-  }
+    const inputName = state.session.inputNames[0];
+    const feeds = {};
+    feeds[inputName] = inputTensor;
 
-  const inputName = state.session.inputNames[0];
-  const feeds = {};
-  feeds[inputName] = inputTensor;
+    // タイムアウト保護 (800ms経過で強制タイムアウトさせ、ハングアップを未然に防止)
+    const runPromise = state.session.run(feeds);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Inference Timeout (>800ms)')), 800)
+    );
 
-  let results;
-  try {
-    results = await state.session.run(feeds);
+    results = await Promise.race([runPromise, timeoutPromise]);
+    state.inferenceTime = (performance.now() - startTime).toFixed(1);
+    state.lastError = '';
+
+    // WebGPU が重すぎる場合 (>350ms) は自動で軽快な WASM に切り替え
+    if (state.activeEp === 'WEBGPU' && parseFloat(state.inferenceTime) > 350) {
+      console.warn(`WebGPU is slow (${state.inferenceTime} ms). Auto-switching to WASM...`);
+      switchToWasm();
+    }
+
+    // 出力テンソルのパース
+    const outputName = state.session.outputNames[0];
+    const outputTensor = results[outputName];
+    return parseYOLO26EndToEndOutput(outputTensor);
+
   } catch (runErr) {
     console.error('Inference session.run error:', runErr);
     state.lastError = `Infer Err: ${runErr.message || runErr}`;
 
-    // WebGPU で実行時エラーが発生した場合、直ちに WASM に安全フォールバック
+    // エラーやハング発生時は安全に WASM にフォールバック
     if (state.activeEp === 'WEBGPU') {
-      console.warn('WebGPU execution failed. Falling back to WASM...');
-      state.activeEp = 'WASM';
-      engineProviderEl.textContent = 'WASM (FALLBACK)';
-      engineProviderEl.style.color = '#FFB000';
-      try {
-        state.session = await ort.InferenceSession.create(MODEL_PATH, {
-          executionProviders: ['wasm'],
-          graphOptimizationLevel: 'all'
-        });
-        state.lastError = '';
-        console.log('[✓] Switched session to WASM successfully');
-      } catch (fbErr) {
-        console.error('WASM fallback failed:', fbErr);
-        state.lastError = `WASM Init Err: ${fbErr.message}`;
-      }
+      switchToWasm();
     }
     return [];
+  } finally {
+    // テンソルメモリの完全解放 (WebGPUハング防止の重要処理)
+    if (inputTensor && typeof inputTensor.dispose === 'function') {
+      try { inputTensor.dispose(); } catch (_) {}
+    }
+    if (results) {
+      for (const k in results) {
+        if (results[k] && typeof results[k].dispose === 'function') {
+          try { results[k].dispose(); } catch (_) {}
+        }
+      }
+    }
   }
-
-  state.inferenceTime = (performance.now() - startTime).toFixed(1);
-  state.lastError = '';
-
-  // 出力テンソルのパース
-  const outputName = state.session.outputNames[0];
-  const outputTensor = results[outputName];
-  return parseYOLO26EndToEndOutput(outputTensor);
 }
 
 // クラス別想定サイズ (ピンホール測距用)
@@ -517,10 +562,9 @@ function parseYOLO26EndToEndOutput(tensor) {
 }
 
 /**
- * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (NaN防止・完全安全版)
+ * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (画面内安全クランプ版)
  */
 function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
-  // 座標が 0.0〜1.0 正規化系か、0〜640ピクセル系かを判定
   const maxVal = Math.max(Math.abs(x1), Math.abs(x2), Math.abs(y1), Math.abs(y2));
   const isNormalized = (maxVal <= 1.05 && maxVal > 0);
 
@@ -529,7 +573,6 @@ function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
   let normX2 = isNormalized ? x2 : x2 / INPUT_WIDTH;
   let normY2 = isNormalized ? y2 : y2 / INPUT_HEIGHT;
 
-  // 0.0〜1.0にクランプ
   normX1 = Math.max(0, Math.min(1, normX1));
   normY1 = Math.max(0, Math.min(1, normY1));
   normX2 = Math.max(0, Math.min(1, normX2));
@@ -540,16 +583,23 @@ function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
   const offX = (state.scaleInfo && typeof state.scaleInfo.offsetX === 'number') ? state.scaleInfo.offsetX : 0;
   const offY = (state.scaleInfo && typeof state.scaleInfo.offsetY === 'number') ? state.scaleInfo.offsetY : 0;
 
-  const boxX = normX1 * rW + offX;
-  const boxY = normY1 * rH + offY;
-  const boxW = Math.max(10, (normX2 - normX1) * rW);
-  const boxH = Math.max(10, (normY2 - normY1) * rH);
+  const rawX1 = normX1 * rW + offX;
+  const rawY1 = normY1 * rH + offY;
+  const rawX2 = normX2 * rW + offX;
+  const rawY2 = normY2 * rH + offY;
+
+  // スマホ縦画面での object-fit: cover に伴う画面外はみ出しを確実に防止し、画面内にクランプ
+  const margin = 16;
+  const safeX1 = Math.max(margin, Math.min(canvas.width - margin - 30, rawX1));
+  const safeY1 = Math.max(margin + 40, Math.min(canvas.height - margin - 60, rawY1));
+  const safeX2 = Math.max(safeX1 + 30, Math.min(canvas.width - margin, rawX2));
+  const safeY2 = Math.max(safeY1 + 30, Math.min(canvas.height - margin - 30, rawY2));
 
   return {
-    x: boxX,
-    y: boxY,
-    width: boxW,
-    height: boxH,
+    x: safeX1,
+    y: safeY1,
+    width: safeX2 - safeX1,
+    height: safeY2 - safeY1,
     score: score,
     classId: classId,
     className: COCO_CLASSES[classId] || `CLASS_${classId}`
@@ -607,10 +657,10 @@ async function renderLoop() {
     state.isProcessing = true;
     runInference().then((detections) => {
       rawDetections = detections;
-      state.isProcessing = false;
       updateHudStats(detections);
     }).catch(err => {
-      console.error('Inference error:', err);
+      console.error('Inference loop error:', err);
+    }).finally(() => {
       state.isProcessing = false;
     });
   }
@@ -793,8 +843,12 @@ function drawTargets(detections) {
     const w = target.width;
     const h = target.height;
 
+    // --- ターゲット領域の薄い半透明ハイライト (存在を即座に視認可能に) ---
+    ctx.fillStyle = isPrimaryTarget ? 'rgba(0, 255, 102, 0.08)' : 'rgba(0, 255, 102, 0.03)';
+    ctx.fillRect(x, y, w, h);
+
     // --- カギ括弧 [ ] の描画 ---
-    const bracketSize = Math.min(22, Math.min(w, h) * 0.28);
+    const bracketSize = Math.min(24, Math.max(10, Math.min(w, h) * 0.28));
 
     ctx.beginPath();
     // 左上 ┌
@@ -831,7 +885,7 @@ function drawTargets(detections) {
       ctx.setLineDash([]);
     }
 
-    // --- 情報テキストの描画 (直上 / 直下) ---
+    // --- 情報テキストの描画 (直上 / 直下・遮光バッジ付き) ---
     ctx.font = 'bold 11px "Share Tech Mono", "Courier New", monospace';
 
     // 上部ヘッダータグ: [LOCKED] HOSTILE (NAME)
@@ -839,15 +893,19 @@ function drawTargets(detections) {
       ? `[LOCKED] HOSTILE (${target.className.toUpperCase()})` 
       : `[TRACK] ${target.className.toUpperCase()}`;
     
-    ctx.fillText(statusText, x, y - 8);
+    const statusWidth = ctx.measureText(statusText).width;
+    ctx.fillStyle = 'rgba(0, 15, 6, 0.85)';
+    ctx.fillRect(x - 2, y - 22, statusWidth + 8, 16);
+    ctx.fillStyle = primaryColor;
+    ctx.fillText(statusText, x + 2, y - 10);
 
     // 枠下部: 距離(Range) & 仰角(Elevation MIL) & 信頼度
     const infoLine1 = `RNG : ${distance} m`;
     const infoLine2 = `ELEV: ${elevationMil} MIL  CONF: ${(target.score * 100).toFixed(0)}%`;
 
-    // 背景に暗いバッジを描画して視認性を確保
+    // 背景に暗いバッジを描画して白飛びを完全に防止
     const textWidth = Math.max(ctx.measureText(infoLine1).width, ctx.measureText(infoLine2).width);
-    ctx.fillStyle = 'rgba(0, 20, 5, 0.65)';
+    ctx.fillStyle = 'rgba(0, 15, 6, 0.85)';
     ctx.fillRect(x - 2, y + h + 4, textWidth + 8, 30);
 
     ctx.fillStyle = primaryColor;

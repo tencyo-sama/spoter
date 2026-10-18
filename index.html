@@ -134,10 +134,21 @@
       text-transform: uppercase;
     }
 
+    .header-left, .header-right {
+      background: rgba(0, 15, 6, 0.82);
+      padding: 8px 12px;
+      border: 1px solid var(--primary-dim);
+      border-radius: 4px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.7);
+      max-width: 48%;
+    }
+
     .hud-tag {
       border: 1px solid var(--primary-color);
       padding: 2px 6px;
-      background: rgba(0, 20, 5, 0.4);
+      background: rgba(0, 20, 5, 0.6);
       display: inline-block;
       margin-bottom: 4px;
     }
@@ -188,10 +199,23 @@
       letter-spacing: 1px;
     }
 
+    .footer-left {
+      background: rgba(0, 15, 6, 0.82);
+      padding: 8px 12px;
+      border: 1px solid var(--primary-dim);
+      border-radius: 4px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.7);
+    }
+
     .hud-controls {
       pointer-events: auto;
       display: flex;
-      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+      max-width: 55%;
     }
 
     .hud-btn {
@@ -371,6 +395,7 @@
       <div class="hud-controls">
         <button id="toggleTargetBtn" class="hud-btn" title="Filter Target: ALL / PERSON / VEHICLE">TGT: ALL</button>
         <button id="toggleThemeBtn" class="hud-btn" title="Cycle Optics: NVG / AMBER / FLIR (B&W)">OPTICS: NVG</button>
+        <button id="toggleEpBtn" class="hud-btn" title="Switch Engine: WASM / WEBGPU">EP: AUTO</button>
         <button id="toggleCameraBtn" class="hud-btn" title="Switch Camera">CAM SW</button>
         <button id="selectModelBtn" class="hud-btn" title="Load custom ONNX">CUSTOM .ONNX</button>
         <input type="file" id="modelFileInput" accept=".onnx" style="display: none;">
@@ -391,6 +416,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261019_04"></script>
+  <script src="app.js?v=20261019_05"></script>
 </body>
 </html>
