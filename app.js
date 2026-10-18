@@ -14,7 +14,7 @@
 const MODEL_PATH = './yolo26n.onnx';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
-const CONFIDENCE_THRESHOLD = 0.28; // 認識感度を0.28に最適化（0.35だとスマホ画角で弾かれやすいため）
+const CONFIDENCE_THRESHOLD = 0.20; // 認識感度を0.20に調整 (室内・スマホ画角でも確実に捉えられる設定)
 const TARGET_CLASS_ID = 0; // 0: person
 const REAL_HUMAN_HEIGHT = 1.7; // 人間の想定平均身長 (m)
 
@@ -37,25 +37,25 @@ const OPTICS_MODES = [
   { id: 'flir', label: 'OPTICS: FLIR (B&W)' }
 ];
 
-// ターゲット追尾モード定義 (パターンC: PERSON / VEHICLE / ALL)
+// ターゲット追尾モード定義 (初期値をALLにして室内テスト時でも確実に即時検知)
 const TARGET_MODES = [
+  {
+    id: 'ALL',
+    label: 'TGT: ALL',
+    headerTag: 'TARGET: ALL HOSTILE',
+    classIds: null // 全物体 (人・物・車すべて)
+  },
   {
     id: 'PERSON',
     label: 'TGT: PERSON',
     headerTag: 'TARGET: PERSON',
-    classIds: [0] // person
+    classIds: [0] // personのみ
   },
   {
     id: 'VEHICLE',
     label: 'TGT: VEHICLE',
     headerTag: 'TARGET: VEHICLE',
     classIds: [1, 2, 3, 5, 7] // bicycle, car, motorcycle, bus, truck
-  },
-  {
-    id: 'ALL',
-    label: 'TGT: ALL HOSTILE',
-    headerTag: 'TARGET: ALL HOSTILE',
-    classIds: null // 全物体
   }
 ];
 
@@ -382,14 +382,48 @@ async function runInference() {
   }
 
   const startTime = performance.now();
-  const inputTensor = preprocessImage(video);
-  const inputName = state.session.inputNames[0];
+  let inputTensor;
+  try {
+    inputTensor = preprocessImage(video);
+  } catch (prepErr) {
+    state.lastError = `Preprocess: ${prepErr.message}`;
+    return [];
+  }
 
+  const inputName = state.session.inputNames[0];
   const feeds = {};
   feeds[inputName] = inputTensor;
 
-  const results = await state.session.run(feeds);
+  let results;
+  try {
+    results = await state.session.run(feeds);
+  } catch (runErr) {
+    console.error('Inference session.run error:', runErr);
+    state.lastError = `Infer Err: ${runErr.message || runErr}`;
+
+    // WebGPU で実行時エラーが発生した場合、直ちに WASM に安全フォールバック
+    if (state.activeEp === 'WEBGPU') {
+      console.warn('WebGPU execution failed. Falling back to WASM...');
+      state.activeEp = 'WASM';
+      engineProviderEl.textContent = 'WASM (FALLBACK)';
+      engineProviderEl.style.color = '#FFB000';
+      try {
+        state.session = await ort.InferenceSession.create(MODEL_PATH, {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all'
+        });
+        state.lastError = '';
+        console.log('[✓] Switched session to WASM successfully');
+      } catch (fbErr) {
+        console.error('WASM fallback failed:', fbErr);
+        state.lastError = `WASM Init Err: ${fbErr.message}`;
+      }
+    }
+    return [];
+  }
+
   state.inferenceTime = (performance.now() - startTime).toFixed(1);
+  state.lastError = '';
 
   // 出力テンソルのパース
   const outputName = state.session.outputNames[0];
@@ -448,6 +482,8 @@ function parseYOLO26EndToEndOutput(tensor) {
     elementStride = 6;
   }
 
+  let maxScore = 0;
+
   // 標準形式 [1, num_boxes, 6]
   for (let i = 0; i < numBoxes; i++) {
     const offset = i * elementStride;
@@ -458,12 +494,15 @@ function parseYOLO26EndToEndOutput(tensor) {
     const score = data[offset + 4];
     const classId = Math.round(data[offset + 5]);
 
+    if (score > maxScore) maxScore = score;
+
     const isMatch = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(classId));
     if (score >= CONFIDENCE_THRESHOLD && isMatch) {
       detections.push(scaleBoundingBox(x1, y1, x2, y2, score, classId));
     }
   }
 
+  state.debugMaxScore = maxScore;
   return detections;
 }
 
@@ -813,8 +852,21 @@ function drawTargets(detections) {
 // UI & 環境パラメータ更新
 // ==========================================
 function updateHudStats(detections) {
-  targetSummaryEl.textContent = `TARGETS: ${detections.length} IN SECTOR`;
-  inferenceTimeEl.textContent = `${state.inferenceTime} ms`;
+  if (targetSummaryEl) {
+    const maxConf = (typeof state.debugMaxScore === 'number' && state.debugMaxScore > 0)
+      ? `${Math.round(state.debugMaxScore * 100)}%`
+      : '0%';
+    targetSummaryEl.textContent = `TARGETS: ${detections.length} [MAX: ${maxConf}]`;
+  }
+  if (inferenceTimeEl) {
+    if (state.lastError) {
+      inferenceTimeEl.textContent = state.lastError;
+      inferenceTimeEl.style.color = '#ff3344';
+    } else {
+      inferenceTimeEl.textContent = `${state.inferenceTime} ms (${state.activeEp})`;
+      inferenceTimeEl.style.color = 'var(--primary-color)';
+    }
+  }
 }
 
 function calculateFps() {
