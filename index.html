@@ -75,8 +75,12 @@
       filter: var(--cam-filter);
       -webkit-filter: var(--cam-filter);
       transform: translateZ(0);
-      will-change: filter;
+      will-change: filter, transform;
       transition: filter 0.25s ease;
+    }
+
+    #webcam.mirrored {
+      transform: scaleX(-1) translateZ(0);
     }
 
     /* メイン描画キャンバス（HUDオーバーレイ専用・軽量透過描画） */
@@ -416,6 +420,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261019_06"></script>
+  <script src="app.js?v=20261019_07"></script>
 </body>
 </html>

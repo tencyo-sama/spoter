@@ -11,7 +11,7 @@
 // ==========================================
 // 定数・設定
 // ==========================================
-const MODEL_PATH = './yolo26n.onnx?v=20261019_06';
+const MODEL_PATH = './yolo26n.onnx?v=20261019_07';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
 const CONFIDENCE_THRESHOLD = 0.15; // 認識感度を0.15に調整 (室内・スマホ画角・遠距離でも確実に捉えられる高感度設定)
@@ -163,6 +163,7 @@ async function initSystem() {
       console.warn('Camera could not be started (using simulated feed for PC/testing):', camErr);
       state.isSimulatedCamera = true;
     }
+    video.classList.toggle('mirrored', state.facingMode === 'user');
     handleResize();
 
     // 2. ONNX Runtime Web セッション初期化 (WebGPU優先 -> WASMフォールバック)
@@ -240,6 +241,7 @@ video.addEventListener('resize', handleResize);
 async function switchCamera() {
   try {
     state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
+    video.classList.toggle('mirrored', state.facingMode === 'user');
     await startCamera();
     handleResize();
   } catch (err) {
@@ -567,7 +569,7 @@ function parseYOLO26EndToEndOutput(tensor) {
 }
 
 /**
- * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (4dc8a4e 動作実績版)
+ * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (インカメラ鏡像・完全座標同期版)
  */
 function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
   const isNormalized = (x1 <= 1.05 && x2 <= 1.05 && y1 <= 1.05 && y2 <= 1.05 && x2 > 0);
@@ -577,14 +579,20 @@ function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
   const normX2 = isNormalized ? x2 : x2 / INPUT_WIDTH;
   const normY2 = isNormalized ? y2 : y2 / INPUT_HEIGHT;
 
-  const { scaleX, scaleY, offsetX, offsetY } = state.scaleInfo;
-  const vw = (video && video.videoWidth > 0) ? video.videoWidth : 640;
-  const vh = (video && video.videoHeight > 0) ? video.videoHeight : 640;
+  const rW = (state.scaleInfo && state.scaleInfo.renderWidth > 0) ? state.scaleInfo.renderWidth : canvas.width;
+  const rH = (state.scaleInfo && state.scaleInfo.renderHeight > 0) ? state.scaleInfo.renderHeight : canvas.height;
+  const offX = (state.scaleInfo && typeof state.scaleInfo.offsetX === 'number') ? state.scaleInfo.offsetX : 0;
+  const offY = (state.scaleInfo && typeof state.scaleInfo.offsetY === 'number') ? state.scaleInfo.offsetY : 0;
 
-  const boxX = normX1 * vw * (scaleX || 1) + (offsetX || 0);
-  const boxY = normY1 * vh * (scaleY || 1) + (offsetY || 0);
-  const boxW = (normX2 - normX1) * vw * (scaleX || 1);
-  const boxH = (normY2 - normY1) * vh * (scaleY || 1);
+  let boxX = normX1 * rW + offX;
+  let boxY = normY1 * rH + offY;
+  let boxW = (normX2 - normX1) * rW;
+  let boxH = (normY2 - normY1) * rH;
+
+  // インカメラ（user）時は鏡像表示に合わせX軸を反転
+  if (state.facingMode === 'user') {
+    boxX = canvas.width - (boxX + boxW);
+  }
 
   const safeClassId = (typeof classId === 'number' && !isNaN(classId)) ? Math.round(classId) : 0;
   const safeClassName = COCO_CLASSES[safeClassId] || `CLASS_${safeClassId}`;
@@ -592,8 +600,8 @@ function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
   return {
     x: boxX,
     y: boxY,
-    width: Math.max(10, boxW),
-    height: Math.max(10, boxH),
+    width: Math.max(12, boxW),
+    height: Math.max(12, boxH),
     score: score,
     classId: safeClassId,
     className: safeClassName
@@ -818,7 +826,7 @@ function drawReticle() {
   ctx.restore();
 }
 
-/** ターゲットの四隅「カギ括弧 [ ]」および観測パラメータ描画 */
+/** ターゲットのバウンディングボックス（完全矩形枠＋太カギ括弧＋リード線＋遮光テキスト）描画 */
 function drawTargets(detections) {
   const primaryColor = getComputedStyle(document.body).getPropertyValue('--primary-color').trim() || '#00FF66';
   const cx = canvas.width / 2;
@@ -826,91 +834,111 @@ function drawTargets(detections) {
   const currentTargetMode = TARGET_MODES[state.targetModeIndex];
 
   detections.forEach((target) => {
-    // 現在のターゲットモード対象なら主ターゲットとしてロックオン
     const isPrimaryTarget = (!currentTargetMode.classIds || currentTargetMode.classIds.includes(target.classId));
     const { distance, elevationMil } = calculateBallisticParams(target);
 
     ctx.save();
     ctx.strokeStyle = primaryColor;
     ctx.fillStyle = primaryColor;
-    ctx.lineWidth = isPrimaryTarget ? 2 : 1;
-    ctx.shadowColor = primaryColor;
-    ctx.shadowBlur = isPrimaryTarget ? 6 : 2;
 
     const x = target.x;
     const y = target.y;
     const w = target.width;
     const h = target.height;
 
-    // --- ターゲット領域の薄い半透明ハイライト (存在を即座に視認可能に) ---
-    ctx.fillStyle = isPrimaryTarget ? 'rgba(0, 255, 102, 0.08)' : 'rgba(0, 255, 102, 0.03)';
+    // 1. ターゲット内部の半透明ミリタリーハイライト (誰が見ても一目で認識領域が分かる)
+    ctx.fillStyle = isPrimaryTarget ? 'rgba(0, 255, 102, 0.12)' : 'rgba(0, 255, 102, 0.04)';
     ctx.fillRect(x, y, w, h);
 
-    // --- カギ括弧 [ ] の描画 ---
-    const bracketSize = Math.min(24, Math.max(10, Math.min(w, h) * 0.28));
+    // 2. ★完全な四角形バウンディングボックス（外枠線）を明瞭に描画！
+    ctx.lineWidth = isPrimaryTarget ? 2 : 1;
+    ctx.strokeStyle = isPrimaryTarget ? primaryColor : 'rgba(0, 255, 102, 0.5)';
+    ctx.strokeRect(x, y, w, h);
 
+    // 3. ★四隅の強調カギ括弧 [ ] の描画 (太さ 3px でミリタリー感を強烈に強調)
+    const bracketLen = Math.min(28, Math.max(12, Math.min(w, h) * 0.25));
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = primaryColor;
     ctx.beginPath();
     // 左上 ┌
-    ctx.moveTo(x, y + bracketSize);
+    ctx.moveTo(x, y + bracketLen);
     ctx.lineTo(x, y);
-    ctx.lineTo(x + bracketSize, y);
-
+    ctx.lineTo(x + bracketLen, y);
     // 右上 ┐
-    ctx.moveTo(x + w - bracketSize, y);
-    ctx.lineTo(x + w);
-    ctx.lineTo(x + w, y + bracketSize);
-
+    ctx.moveTo(x + w - bracketLen, y);
+    ctx.lineTo(x + w, y);
+    ctx.lineTo(x + w, y + bracketLen);
     // 左下 └
-    ctx.moveTo(x, y + h - bracketSize);
+    ctx.moveTo(x, y + h - bracketLen);
     ctx.lineTo(x, y + h);
-    ctx.lineTo(x + bracketSize, y + h);
-
+    ctx.lineTo(x + bracketLen, y + h);
     // 右下 ┘
-    ctx.moveTo(x + w - bracketSize, y + h);
+    ctx.moveTo(x + w - bracketLen, y + h);
     ctx.lineTo(x + w, y + h);
-    ctx.lineTo(x + w, y + h - bracketSize);
+    ctx.lineTo(x + w, y + h - bracketLen);
     ctx.stroke();
 
-    // ターゲット中心と画面中心の照準リード線（主ターゲットのみ結線）
+    // 4. ★照準レティクル中心からターゲット中心への破線リード線（太さ 2px・鮮明破線）
     if (isPrimaryTarget) {
       const targetCx = x + w / 2;
       const targetCy = y + h / 2;
       ctx.beginPath();
-      ctx.setLineDash([2, 6]);
+      ctx.setLineDash([8, 6]);
+      ctx.lineWidth = 2;
       ctx.strokeStyle = primaryColor;
       ctx.moveTo(cx, cy);
       ctx.lineTo(targetCx, targetCy);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // ターゲット中心のミリタリー＋印
+      ctx.beginPath();
+      ctx.moveTo(targetCx - 6, targetCy);
+      ctx.lineTo(targetCx + 6, targetCy);
+      ctx.moveTo(targetCx, targetCy - 6);
+      ctx.lineTo(targetCx, targetCy + 6);
+      ctx.stroke();
     }
 
-    // --- 情報テキストの描画 (直上 / 直下・遮光バッジ付き) ---
-    ctx.font = 'bold 11px "Share Tech Mono", "Courier New", monospace';
-
-    // 上部ヘッダータグ: [LOCKED] HOSTILE (NAME)
+    // 5. ★情報テキスト（画面端でも絶対に隠れない安全配置ロジック）
+    ctx.font = 'bold 12px "Share Tech Mono", "Courier New", monospace';
     const displayName = (target.className || 'TARGET').toUpperCase();
-    const statusText = isPrimaryTarget 
-      ? `[LOCKED] HOSTILE (${displayName})` 
-      : `[TRACK] ${displayName}`;
-    
-    const statusWidth = ctx.measureText(statusText).width;
-    ctx.fillStyle = 'rgba(0, 15, 6, 0.85)';
-    ctx.fillRect(x - 2, y - 22, statusWidth + 8, 16);
+    const confPct = Math.round(target.score * 100);
+    const titleText = isPrimaryTarget 
+      ? `[LOCKED] ${displayName} ${confPct}%` 
+      : `[TRACK] ${displayName} ${confPct}%`;
+    const subText = `RNG: ${distance}m | ELEV: ${elevationMil} MIL`;
+
+    const titleW = ctx.measureText(titleText).width;
+    const subW = ctx.measureText(subText).width;
+
+    // 上部テキスト: 画面上端（ヘッダー下）に隠れる場合は枠の内側上部に描画
+    let titleY = y - 8;
+    if (titleY < 60) {
+      titleY = y + 18;
+    }
+    // 上部遮光ブラックバッジ
+    ctx.fillStyle = 'rgba(0, 15, 6, 0.90)';
+    ctx.fillRect(x - 2, titleY - 14, titleW + 8, 18);
+    ctx.strokeStyle = primaryColor;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 2, titleY - 14, titleW + 8, 18);
+
     ctx.fillStyle = primaryColor;
-    ctx.fillText(statusText, x + 2, y - 10);
+    ctx.fillText(titleText, x + 2, titleY);
 
-    // 枠下部: 距離(Range) & 仰角(Elevation MIL) & 信頼度
-    const infoLine1 = `RNG : ${distance} m`;
-    const infoLine2 = `ELEV: ${elevationMil} MIL  CONF: ${(target.score * 100).toFixed(0)}%`;
-
-    // 背景に暗いバッジを描画して白飛びを完全に防止
-    const textWidth = Math.max(ctx.measureText(infoLine1).width, ctx.measureText(infoLine2).width);
-    ctx.fillStyle = 'rgba(0, 15, 6, 0.85)';
-    ctx.fillRect(x - 2, y + h + 4, textWidth + 8, 30);
+    // 下部テキスト: 画面下端（フッター上）に隠れる場合は枠の内側下部に描画
+    let subY = y + h + 18;
+    if (subY > canvas.height - 70) {
+      subY = y + h - 8;
+    }
+    // 下部遮光ブラックバッジ
+    ctx.fillStyle = 'rgba(0, 15, 6, 0.90)';
+    ctx.fillRect(x - 2, subY - 14, subW + 8, 18);
+    ctx.strokeRect(x - 2, subY - 14, subW + 8, 18);
 
     ctx.fillStyle = primaryColor;
-    ctx.fillText(infoLine1, x + 2, y + h + 16);
-    ctx.fillText(infoLine2, x + 2, y + h + 28);
+    ctx.fillText(subText, x + 2, subY);
 
     ctx.restore();
   });
