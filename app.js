@@ -11,7 +11,7 @@
 // ==========================================
 // 定数・設定
 // ==========================================
-const MODEL_PATH = './yolo26n.onnx?v=20261019_05';
+const MODEL_PATH = './yolo26n.onnx?v=20261019_06';
 const INPUT_WIDTH = 640;
 const INPUT_HEIGHT = 640;
 const CONFIDENCE_THRESHOLD = 0.15; // 認識感度を0.15に調整 (室内・スマホ画角・遠距離でも確実に捉えられる高感度設定)
@@ -238,9 +238,14 @@ video.addEventListener('playing', handleResize);
 video.addEventListener('resize', handleResize);
 
 async function switchCamera() {
-  state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-  await startCamera();
-  handleResize();
+  try {
+    state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
+    await startCamera();
+    handleResize();
+  } catch (err) {
+    console.error('switchCamera error:', err);
+    state.lastError = `Cam Err: ${err.message || err}`;
+  }
 }
 
 function handleResize() {
@@ -562,47 +567,36 @@ function parseYOLO26EndToEndOutput(tensor) {
 }
 
 /**
- * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (画面内安全クランプ版)
+ * 640x640 または 0~1 正規化座標系から Canvas描画座標系へのマッピング (4dc8a4e 動作実績版)
  */
 function scaleBoundingBox(x1, y1, x2, y2, score, classId) {
-  const maxVal = Math.max(Math.abs(x1), Math.abs(x2), Math.abs(y1), Math.abs(y2));
-  const isNormalized = (maxVal <= 1.05 && maxVal > 0);
+  const isNormalized = (x1 <= 1.05 && x2 <= 1.05 && y1 <= 1.05 && y2 <= 1.05 && x2 > 0);
 
-  let normX1 = isNormalized ? x1 : x1 / INPUT_WIDTH;
-  let normY1 = isNormalized ? y1 : y1 / INPUT_HEIGHT;
-  let normX2 = isNormalized ? x2 : x2 / INPUT_WIDTH;
-  let normY2 = isNormalized ? y2 : y2 / INPUT_HEIGHT;
+  const normX1 = isNormalized ? x1 : x1 / INPUT_WIDTH;
+  const normY1 = isNormalized ? y1 : y1 / INPUT_HEIGHT;
+  const normX2 = isNormalized ? x2 : x2 / INPUT_WIDTH;
+  const normY2 = isNormalized ? y2 : y2 / INPUT_HEIGHT;
 
-  normX1 = Math.max(0, Math.min(1, normX1));
-  normY1 = Math.max(0, Math.min(1, normY1));
-  normX2 = Math.max(0, Math.min(1, normX2));
-  normY2 = Math.max(0, Math.min(1, normY2));
+  const { scaleX, scaleY, offsetX, offsetY } = state.scaleInfo;
+  const vw = (video && video.videoWidth > 0) ? video.videoWidth : 640;
+  const vh = (video && video.videoHeight > 0) ? video.videoHeight : 640;
 
-  const rW = (state.scaleInfo && state.scaleInfo.renderWidth > 0) ? state.scaleInfo.renderWidth : canvas.width;
-  const rH = (state.scaleInfo && state.scaleInfo.renderHeight > 0) ? state.scaleInfo.renderHeight : canvas.height;
-  const offX = (state.scaleInfo && typeof state.scaleInfo.offsetX === 'number') ? state.scaleInfo.offsetX : 0;
-  const offY = (state.scaleInfo && typeof state.scaleInfo.offsetY === 'number') ? state.scaleInfo.offsetY : 0;
+  const boxX = normX1 * vw * (scaleX || 1) + (offsetX || 0);
+  const boxY = normY1 * vh * (scaleY || 1) + (offsetY || 0);
+  const boxW = (normX2 - normX1) * vw * (scaleX || 1);
+  const boxH = (normY2 - normY1) * vh * (scaleY || 1);
 
-  const rawX1 = normX1 * rW + offX;
-  const rawY1 = normY1 * rH + offY;
-  const rawX2 = normX2 * rW + offX;
-  const rawY2 = normY2 * rH + offY;
-
-  // スマホ縦画面での object-fit: cover に伴う画面外はみ出しを確実に防止し、画面内にクランプ
-  const margin = 16;
-  const safeX1 = Math.max(margin, Math.min(canvas.width - margin - 30, rawX1));
-  const safeY1 = Math.max(margin + 40, Math.min(canvas.height - margin - 60, rawY1));
-  const safeX2 = Math.max(safeX1 + 30, Math.min(canvas.width - margin, rawX2));
-  const safeY2 = Math.max(safeY1 + 30, Math.min(canvas.height - margin - 30, rawY2));
+  const safeClassId = (typeof classId === 'number' && !isNaN(classId)) ? Math.round(classId) : 0;
+  const safeClassName = COCO_CLASSES[safeClassId] || `CLASS_${safeClassId}`;
 
   return {
-    x: safeX1,
-    y: safeY1,
-    width: safeX2 - safeX1,
-    height: safeY2 - safeY1,
+    x: boxX,
+    y: boxY,
+    width: Math.max(10, boxW),
+    height: Math.max(10, boxH),
     score: score,
-    classId: classId,
-    className: COCO_CLASSES[classId] || `CLASS_${classId}`
+    classId: safeClassId,
+    className: safeClassName
   };
 }
 
@@ -635,51 +629,58 @@ let smoothedTargets = []; // 毎フレームスムーズにLerp補間される�
 async function renderLoop() {
   if (!state.isRunning) return;
 
-  state.renderCount++;
-
-  // ビデオ解像度が遅れて確定した場合の自動再計算
-  if (video.videoWidth > 0 && (!state.scaleInfo.renderWidth || state.scaleInfo.renderWidth === canvas.width)) {
-    handleResize();
-  }
-
-  // FPS計測
-  calculateFps();
-
-  // 1. HUDキャンバスのクリア
-  drawCameraFeed();
-
-  // 2. 推論実行：スマホカメラ準備判定 (videoWidth > 0 かつ readyState >= 2)
-  const isVideoReady = (!state.isSimulatedCamera && video.videoWidth > 0 && (video.readyState >= 2 || video.currentTime > 0));
-  const canRunInference = (isVideoReady || state.isSimulatedCamera);
-  const shouldInferThisFrame = (state.renderCount % 2 === 0);
-
-  if (shouldInferThisFrame && !state.isProcessing && canRunInference) {
-    state.isProcessing = true;
-    runInference().then((detections) => {
-      rawDetections = detections;
-      updateHudStats(detections);
-    }).catch(err => {
-      console.error('Inference loop error:', err);
-    }).finally(() => {
-      state.isProcessing = false;
-    });
-  }
-
-  // 3. バウンディングボックスの線形補間（Lerp）追従計算
-  updateSmoothedTargets();
-
-  // 4. レティクル（中央十字線 & MILドット目盛り）描画
-  drawReticle();
-
-  // 5. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画 (毎フレーム描画)
-  drawTargets(smoothedTargets);
-
+  // ★先頭で requestAnimationFrame を呼ぶことで例外が起きてもループを絶対に止めない
   requestAnimationFrame(renderLoop);
+
+  try {
+    state.renderCount++;
+
+    // ビデオ解像度が遅れて確定した場合の自動再計算
+    if (video.videoWidth > 0 && (!state.scaleInfo.renderWidth || state.scaleInfo.renderWidth === canvas.width)) {
+      handleResize();
+    }
+
+    // FPS計測
+    calculateFps();
+
+    // 1. HUDキャンバスのクリア
+    drawCameraFeed();
+
+    // 2. 推論実行：スマホカメラ準備判定 (videoWidth > 0 かつ readyState >= 2)
+    const isVideoReady = (!state.isSimulatedCamera && video.videoWidth > 0 && (video.readyState >= 2 || video.currentTime > 0));
+    const canRunInference = (isVideoReady || state.isSimulatedCamera);
+    const shouldInferThisFrame = (state.renderCount % 2 === 0);
+
+    if (shouldInferThisFrame && !state.isProcessing && canRunInference) {
+      state.isProcessing = true;
+      runInference().then((detections) => {
+        rawDetections = detections;
+        updateHudStats(detections);
+      }).catch(err => {
+        console.error('Inference loop error:', err);
+      }).finally(() => {
+        state.isProcessing = false;
+      });
+    }
+
+    // 3. バウンディングボックスの線形補間（Lerp）追従計算
+    updateSmoothedTargets();
+
+    // 4. レティクル（中央十字線 & MILドット目盛り）描画
+    drawReticle();
+
+    // 5. ターゲット検出枠（カギ括弧 [ ]）および情報テキスト描画 (毎フレーム描画)
+    drawTargets(smoothedTargets);
+
+  } catch (loopErr) {
+    console.error('Render loop error:', loopErr);
+    state.lastError = `Draw Err: ${loopErr.message || loopErr}`;
+  }
 }
 
-/** ターゲット位置の指数移動平均（Lerp）補間処理 */
+/** ターゲット位置の指数移動平均（Lerp）補間処理 (4dc8a4e 安定復元版) */
 function updateSmoothedTargets() {
-  const lerpFactor = 0.5;
+  const lerpFactor = 0.45;
 
   if (!rawDetections || rawDetections.length === 0) {
     smoothedTargets = [];
@@ -695,18 +696,16 @@ function updateSmoothedTargets() {
   // 同一ターゲット数なら滑らかに追尾
   for (let i = 0; i < rawDetections.length; i++) {
     const raw = rawDetections[i];
-    const cur = smoothedTargets[i];
+    const smoothed = smoothedTargets[i];
+    if (!smoothed || !raw) continue;
 
-    if (!cur || cur.classId !== raw.classId) {
-      smoothedTargets[i] = { ...raw };
-      continue;
-    }
-
-    cur.x += (raw.x - cur.x) * lerpFactor;
-    cur.y += (raw.y - cur.y) * lerpFactor;
-    cur.width += (raw.width - cur.width) * lerpFactor;
-    cur.height += (raw.height - cur.height) * lerpFactor;
-    cur.score = raw.score;
+    smoothed.x += (raw.x - smoothed.x) * lerpFactor;
+    smoothed.y += (raw.y - smoothed.y) * lerpFactor;
+    smoothed.width += (raw.width - smoothed.width) * lerpFactor;
+    smoothed.height += (raw.height - smoothed.height) * lerpFactor;
+    smoothed.score = raw.score;
+    smoothed.classId = raw.classId;
+    smoothed.className = raw.className;
   }
 }
 
@@ -889,9 +888,10 @@ function drawTargets(detections) {
     ctx.font = 'bold 11px "Share Tech Mono", "Courier New", monospace';
 
     // 上部ヘッダータグ: [LOCKED] HOSTILE (NAME)
+    const displayName = (target.className || 'TARGET').toUpperCase();
     const statusText = isPrimaryTarget 
-      ? `[LOCKED] HOSTILE (${target.className.toUpperCase()})` 
-      : `[TRACK] ${target.className.toUpperCase()}`;
+      ? `[LOCKED] HOSTILE (${displayName})` 
+      : `[TRACK] ${displayName}`;
     
     const statusWidth = ctx.measureText(statusText).width;
     ctx.fillStyle = 'rgba(0, 15, 6, 0.85)';
